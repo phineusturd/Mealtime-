@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ClipboardCheck, Flame, SlidersHorizontal } from 'lucide-react';
 import {
   DEFAULT_KITCHEN_GEAR,
@@ -15,6 +15,7 @@ import {
   INITIAL_SCHEDULE,
 } from './data/presets';
 import { formatTime12Hour, shiftTime12Hour } from './lib/scheduleUtils';
+import { postJsonWithTimeout, type ApiRequestError } from './lib/apiClient';
 import { MealSetupView } from './components/MealSetupView';
 import { PrepReviewView } from './components/PrepReviewView';
 import { CookNowView } from './components/CookNowView';
@@ -61,7 +62,10 @@ export default function App() {
   // Schedule & generation state
   const [schedule, setSchedule] = useState<CookingSchedule>(INITIAL_SCHEDULE);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
-  const [generateError, setGenerateError] = useState<string | null>(null);
+  const [generateElapsedSecs, setGenerateElapsedSecs] = useState<number>(0);
+  const [generateStatusText, setGenerateStatusText] = useState<string>('');
+  const [generateError, setGenerateError] = useState<ApiRequestError | null>(null);
+  const generateAbortRef = useRef<AbortController | null>(null);
 
   // View 2 & View 3 progress state
   const [checkedSetupIndices, setCheckedSetupIndices] = useState<Set<number>>(new Set());
@@ -88,6 +92,25 @@ export default function App() {
       // Ignore storage quota errors
     }
   }, [savedRecipes]);
+
+  // Track elapsed seconds during schedule generation
+  useEffect(() => {
+    if (!isGenerating) {
+      setGenerateElapsedSecs(0);
+      return;
+    }
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      setGenerateElapsedSecs(Math.floor((Date.now() - startedAt) / 1000));
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [isGenerating]);
+
+  useEffect(() => {
+    return () => {
+      generateAbortRef.current?.abort();
+    };
+  }, []);
 
   // Tick all background passive timers every second across views
   useEffect(() => {
@@ -133,31 +156,69 @@ export default function App() {
     setSavedRecipes((prev) => prev.filter((r) => r.id !== id));
   };
 
+  const handleCancelGenerate = () => {
+    generateAbortRef.current?.abort();
+    generateAbortRef.current = null;
+    setIsGenerating(false);
+  };
+
   const handleGenerateSchedule = async () => {
     if (recipes.length === 0) return;
+
+    generateAbortRef.current?.abort();
+    const abortController = new AbortController();
+    generateAbortRef.current = abortController;
+
     setIsGenerating(true);
+    setGenerateStatusText(
+      `Scheduling ${recipes.length} ${
+        recipes.length === 1 ? 'dish' : 'dishes'
+      } across your kitchen gear...`
+    );
     setGenerateError(null);
 
     try {
-      const res = await fetch('/api/schedule', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const result = await postJsonWithTimeout<{ schedule?: CookingSchedule }>({
+        url: '/api/schedule',
+        body: {
           targetEatTime: formatTime12Hour(targetEatTime),
           startTime: startTimeEnabled ? formatTime12Hour(startTime) : undefined,
           makeAheadToday,
           recipes,
           gear,
-        }),
+        },
+        stepLabel: 'Generating meal schedule',
+        defaultNextStep:
+          'Tap "Generate Meal Schedule" to retry, or shorten very long pasted recipe notes.',
+        timeoutMs: 25000,
+        maxColdStartRetries: 2,
+        retryDelayMs: 1500,
+        externalSignal: abortController.signal,
+        onStatusUpdate: (status) => setGenerateStatusText(status),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Could not generate meal schedule.');
+
+      if (result.cancelled) {
+        return;
+      }
+
+      if (result.error) {
+        setGenerateError(result.error);
+        return;
+      }
+
+      const rawSchedule = result.data?.schedule;
+      if (!rawSchedule || !Array.isArray(rawSchedule.steps) || rawSchedule.steps.length === 0) {
+        setGenerateError({
+          step: 'Generating meal schedule',
+          message: 'Server returned an incomplete schedule without cooking steps.',
+          nextStep: 'Tap "Generate Meal Schedule" again.',
+        });
+        return;
       }
 
       const nextSchedule: CookingSchedule = {
-        ...data.schedule,
-        target_eat_time: formatTime12Hour(data.schedule.target_eat_time || targetEatTime),
+        ...rawSchedule,
+        target_eat_time: formatTime12Hour(rawSchedule.target_eat_time || targetEatTime),
       };
 
       setSchedule(nextSchedule);
@@ -169,9 +230,15 @@ export default function App() {
       setActiveView('prep');
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
-      setGenerateError((err as Error).message || 'Failed to build schedule.');
+      setGenerateError({
+        step: 'Generating meal schedule',
+        message: err instanceof Error ? err.message : String(err),
+        nextStep: 'Tap "Generate Meal Schedule" to try again.',
+      });
     } finally {
+      generateAbortRef.current = null;
       setIsGenerating(false);
+      setGenerateStatusText('');
     }
   };
 
@@ -284,7 +351,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#F4F5F7] text-[#090D16] flex flex-col">
-      {/* Compact Non-Sticky Top Brand Row (preserves <15% sticky cap on mobile) */}
+      {/* Compact Non-Sticky Top Brand Row */}
       <header className="px-4 sm:px-6 pt-4 pb-2 max-w-5xl w-full mx-auto flex items-center justify-between gap-4">
         <span className="font-display text-lg font-extrabold tracking-tight text-slate-950 whitespace-nowrap">
           Mise &amp; Pass
@@ -294,7 +361,7 @@ export default function App() {
         </span>
       </header>
 
-      {/* Main Content Area (padded above fixed bottom nav) */}
+      {/* Main Content Area */}
       <main className="flex-1 w-full max-w-5xl mx-auto px-4 sm:px-6 pt-2 pb-28">
         {activeView === 'setup' && (
           <MealSetupView
@@ -306,6 +373,8 @@ export default function App() {
             savedRecipes={savedRecipes}
             gear={gear}
             isGenerating={isGenerating}
+            generateElapsedSecs={generateElapsedSecs}
+            generateStatusText={generateStatusText}
             generateError={generateError}
             onChangeTargetEatTime={handleChangeTargetEatTime}
             onToggleStartTime={setStartTimeEnabled}
@@ -317,6 +386,8 @@ export default function App() {
             onRemoveSavedRecipe={handleRemoveSavedRecipe}
             onUpdateGear={setGear}
             onGenerateSchedule={handleGenerateSchedule}
+            onCancelGenerate={handleCancelGenerate}
+            onDismissGenerateError={() => setGenerateError(null)}
           />
         )}
 
@@ -374,7 +445,9 @@ export default function App() {
                 }}
                 aria-current={active ? 'page' : undefined}
                 className={`flex flex-col items-center justify-center gap-1 min-h-[56px] transition-colors relative ${
-                  active ? 'text-slate-950 font-bold' : 'text-slate-500 hover:text-slate-800 font-medium'
+                  active
+                    ? 'text-slate-950 font-bold'
+                    : 'text-slate-500 hover:text-slate-800 font-medium'
                 }`}
               >
                 {active && (

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   Bookmark,
@@ -25,6 +25,7 @@ import {
   shiftTime12Hour,
   toHtmlTimeValue,
 } from '../lib/scheduleUtils';
+import { postJsonWithTimeout, type ApiRequestError } from '../lib/apiClient';
 
 interface MealSetupViewProps {
   targetEatTime: string;
@@ -35,7 +36,9 @@ interface MealSetupViewProps {
   savedRecipes: SavedRecipe[];
   gear: KitchenGearConfig;
   isGenerating: boolean;
-  generateError: string | null;
+  generateElapsedSecs: number;
+  generateStatusText: string;
+  generateError: ApiRequestError | null;
   onChangeTargetEatTime: (next: string) => void;
   onToggleStartTime: (enabled: boolean) => void;
   onChangeStartTime: (next: string) => void;
@@ -46,9 +49,61 @@ interface MealSetupViewProps {
   onRemoveSavedRecipe: (id: string) => void;
   onUpdateGear: (next: KitchenGearConfig) => void;
   onGenerateSchedule: () => void;
+  onCancelGenerate: () => void;
+  onDismissGenerateError: () => void;
 }
 
 const QUICK_DINNER_TIMES = ['5:30 PM', '6:00 PM', '6:30 PM', '7:00 PM', '7:30 PM', '8:00 PM'];
+
+function containsLinkToken(text: string): boolean {
+  const lower = text.toLowerCase();
+  return lower.includes('http://') || lower.includes('https://') || lower.includes('www.');
+}
+
+function findFirstUrl(text: string): string | undefined {
+  const tokens = text.trim().split(/\s+/);
+  for (const token of tokens) {
+    const clean = token.replace(/^[<(]+|[>),.;!?]+$/g, '');
+    if (clean.toLowerCase().startsWith('http://') || clean.toLowerCase().startsWith('https://')) {
+      return clean;
+    }
+  }
+  return undefined;
+}
+
+function buildFallbackTitle(raw: string): string {
+  const trimmed = raw.trim();
+  const url = findFirstUrl(trimmed);
+  if (url && trimmed === url) {
+    try {
+      const parsed = new URL(url);
+      const segments = parsed.pathname
+        .split('/')
+        .map((s) => s.trim())
+        .filter((s) => s.length > 2 && !/^\d+$/.test(s) && s !== 'recipe' && s !== 'recipes');
+      const slug = segments[segments.length - 1];
+      if (slug) {
+        const readable = decodeURIComponent(slug)
+          .replace(/\.[a-z0-9]+$/i, '')
+          .replace(/[-_]+/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (readable.length >= 3) {
+          return readable.replace(/\b\w/g, (c) => c.toUpperCase()).slice(0, 72);
+        }
+      }
+    } catch {
+      // fall through to line-based title
+    }
+  }
+
+  const firstLine = trimmed
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  if (!firstLine) return 'Custom Recipe';
+  return firstLine.length > 72 ? `${firstLine.slice(0, 72).trim()}…` : firstLine;
+}
 
 export const MealSetupView: React.FC<MealSetupViewProps> = ({
   targetEatTime,
@@ -59,6 +114,8 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
   savedRecipes,
   gear,
   isGenerating,
+  generateElapsedSecs,
+  generateStatusText,
   generateError,
   onChangeTargetEatTime,
   onToggleStartTime,
@@ -70,12 +127,38 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
   onRemoveSavedRecipe,
   onUpdateGear,
   onGenerateSchedule,
+  onCancelGenerate,
+  onDismissGenerateError,
 }) => {
   const [recipeInput, setRecipeInput] = useState('');
   const [isAddingRecipe, setIsAddingRecipe] = useState(false);
-  const [recipeError, setRecipeError] = useState<string | null>(null);
+  const [recipeStatusText, setRecipeStatusText] = useState<string>('');
+  const [recipeElapsedSecs, setRecipeElapsedSecs] = useState(0);
+  const [recipeError, setRecipeError] = useState<
+    (ApiRequestError & { addedAnywayTitle?: string }) | null
+  >(null);
   const [gearOpen, setGearOpen] = useState(false);
   const [savedDrawerOpen, setSavedDrawerOpen] = useState(false);
+
+  const recipeAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    if (!isAddingRecipe) {
+      setRecipeElapsedSecs(0);
+      return;
+    }
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      setRecipeElapsedSecs(Math.floor((Date.now() - startedAt) / 1000));
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [isAddingRecipe]);
+
+  useEffect(() => {
+    return () => {
+      recipeAbortRef.current?.abort();
+    };
+  }, []);
 
   const autoGearCount = [
     gear.samsungFlexDuo,
@@ -87,44 +170,109 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
 
   const explicitGearCount = [gear.outdoorGrill, gear.pelletPizzaOven].filter(Boolean).length;
 
+  const handleCancelRecipeParse = () => {
+    recipeAbortRef.current?.abort();
+    recipeAbortRef.current = null;
+    setIsAddingRecipe(false);
+    setRecipeStatusText('');
+  };
+
+  const addRecipeUnparsed = (raw: string): string => {
+    const fallbackTitle = buildFallbackTitle(raw);
+    const sourceUrl = findFirstUrl(raw);
+    onAddRecipe({
+      id: `rec-${Date.now()}`,
+      title: fallbackTitle,
+      rawText: raw,
+      sourceUrl,
+      prepMode: 'parallel',
+    });
+    setRecipeInput('');
+    return fallbackTitle;
+  };
+
   const handleAddRecipeSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = recipeInput.trim();
     if (!trimmed) return;
 
     setRecipeError(null);
-    const isUrl = /^https?:\/\/\S+$/i.test(trimmed);
+    const hasLink = containsLinkToken(trimmed);
     const isLongPaste = trimmed.length > 90 || trimmed.includes('\n');
 
-    if (isUrl || isLongPaste) {
+    if (hasLink || isLongPaste) {
+      recipeAbortRef.current?.abort();
+      const abortController = new AbortController();
+      recipeAbortRef.current = abortController;
+
       setIsAddingRecipe(true);
+      setRecipeStatusText(
+        hasLink
+          ? 'Fetching recipe link and extracting cook steps...'
+          : 'Reading pasted recipe and extracting cook times...'
+      );
+
       try {
-        const res = await fetch('/api/extract-recipe', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ input: trimmed }),
+        const result = await postJsonWithTimeout<{
+          title?: string;
+          summary?: string;
+          suggestedPrepMode?: PrepMode;
+          sourceUrl?: string;
+        }>({
+          url: '/api/extract-recipe',
+          body: { input: trimmed },
+          stepLabel: hasLink ? 'Fetching & parsing recipe link' : 'Parsing pasted recipe text',
+          defaultNextStep:
+            'Your recipe was still added to tonight’s list — tap "Generate Meal Schedule" when ready and the planner will parse it directly.',
+          timeoutMs: 25000,
+          maxColdStartRetries: 2,
+          retryDelayMs: 1500,
+          externalSignal: abortController.signal,
+          onStatusUpdate: (status) => setRecipeStatusText(status),
         });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || 'Could not parse that recipe.');
+
+        if (result.cancelled) {
+          return;
         }
+
+        if (result.error) {
+          const addedTitle = addRecipeUnparsed(trimmed);
+          setRecipeError({
+            ...result.error,
+            nextStep:
+              'Added to tonight’s list as-is — tap "Generate Meal Schedule" when ready and the schedule generator will parse the full recipe text automatically.',
+            addedAnywayTitle: addedTitle,
+          });
+          return;
+        }
+
+        const data = result.data ?? {};
         onAddRecipe({
           id: `rec-${Date.now()}`,
-          title: data.title || trimmed.slice(0, 60),
-          rawText: data.summary ? `${data.summary}\n${trimmed.slice(0, 600)}` : trimmed,
-          sourceUrl: data.sourceUrl,
+          title: data.title?.trim() || buildFallbackTitle(trimmed),
+          rawText: data.summary?.trim() ? data.summary.trim() : trimmed,
+          sourceUrl: data.sourceUrl ?? findFirstUrl(trimmed),
           prepMode: data.suggestedPrepMode === 'prep_ahead' ? 'prep_ahead' : 'parallel',
         });
         setRecipeInput('');
       } catch (err) {
-        setRecipeError((err as Error).message || 'Could not extract recipe.');
+        const addedTitle = addRecipeUnparsed(trimmed);
+        setRecipeError({
+          step: 'Parsing recipe',
+          message: err instanceof Error ? err.message : String(err),
+          nextStep:
+            'Added to tonight’s list as-is — tap "Generate Meal Schedule" when ready and the schedule generator will parse it automatically.',
+          addedAnywayTitle: addedTitle,
+        });
       } finally {
+        recipeAbortRef.current = null;
         setIsAddingRecipe(false);
+        setRecipeStatusText('');
       }
       return;
     }
 
-    // Short direct dish entry — add instantaneously
+    // Short direct dish entry — add instantaneously without network wait
     onAddRecipe({
       id: `rec-${Date.now()}`,
       title: trimmed,
@@ -302,19 +450,85 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
               </button>
             </div>
 
-            <form onSubmit={handleAddRecipeSubmit} className="space-y-3">
+            <form noValidate onSubmit={handleAddRecipeSubmit} className="space-y-3">
               <textarea
                 value={recipeInput}
-                onChange={(e) => setRecipeInput(e.target.value)}
+                onChange={(e) => {
+                  setRecipeInput(e.target.value);
+                  if (recipeError) setRecipeError(null);
+                }}
                 rows={3}
-                placeholder="Paste a recipe URL, full recipe text, or type a dish (e.g. Garlic herb roast chicken at 425°F for 60 min)"
+                autoComplete="off"
+                placeholder="Paste any recipe text, link, or dish name (e.g. Garlic herb roast chicken at 425°F for 60 min)"
                 className="w-full p-4 text-base bg-slate-50 border border-slate-300 rounded-2xl text-slate-950 placeholder:text-slate-400 focus:outline-none focus:border-slate-950 focus:bg-white transition-colors resize-y"
               />
 
+              {/* Live Recipe Parsing Status Indicator */}
+              {isAddingRecipe && (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="p-4 rounded-2xl bg-slate-900 text-white space-y-2.5"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <Loader2 className="w-5 h-5 animate-spin shrink-0 text-emerald-400" />
+                      <span className="text-sm font-semibold leading-snug">
+                        {recipeStatusText || 'Reading recipe...'}
+                      </span>
+                    </div>
+                    <span className="text-xs font-mono tabular-nums text-slate-300 shrink-0">
+                      {recipeElapsedSecs}s / 25s
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-3 pt-1">
+                    <span className="text-xs text-slate-300">
+                      Auto-stops if it takes longer than 25 seconds.
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleCancelRecipeParse}
+                      className="min-h-[36px] px-3 rounded-lg bg-white/15 hover:bg-white/25 text-xs font-semibold text-white transition-colors whitespace-nowrap"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Visible Recipe Notice / Error Box (confirms recipe was still added cleanly) */}
               {recipeError && (
-                <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-sm text-rose-800 flex items-start gap-2">
-                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                  <span>{recipeError}</span>
+                <div
+                  role="alert"
+                  className="p-4 rounded-2xl bg-amber-50 border-2 border-amber-300 text-amber-950 space-y-2"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+                      <div>
+                        <div className="text-sm font-bold">
+                          {recipeError.addedAnywayTitle
+                            ? `Added "${recipeError.addedAnywayTitle}" — quick preview skipped`
+                            : `Failed at: ${recipeError.step}`}
+                        </div>
+                        <p className="text-xs text-amber-900 mt-1 break-words">
+                          <span className="font-semibold">Parser note:</span> {recipeError.message}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setRecipeError(null)}
+                      aria-label="Dismiss recipe notice"
+                      className="min-h-[36px] min-w-[36px] rounded-lg flex items-center justify-center text-amber-800 hover:bg-amber-100 shrink-0"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+
+                  <p className="text-xs text-amber-950 leading-relaxed font-medium">
+                    {recipeError.nextStep}
+                  </p>
                 </div>
               )}
 
@@ -326,7 +540,7 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
                 {isAddingRecipe ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    Reading Recipe...
+                    Parsing Recipe ({recipeElapsedSecs}s)...
                   </>
                 ) : (
                   <>
@@ -446,7 +660,6 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
 
             {gearOpen && (
               <div className="px-5 pb-5 pt-2 border-t border-slate-200 space-y-4">
-                {/* Auto-assign Appliances */}
                 <div className="space-y-2.5">
                   <div className="text-xs font-semibold text-slate-500">
                     Auto-Assign Indoor Appliances
@@ -509,7 +722,6 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
                     )}
                   </div>
 
-                  {/* Breville Smart Oven Air Fryer Pro */}
                   <GearToggleRow
                     title="Breville Smart Oven Air Fryer Pro"
                     subtitle="Fast preheat, air fry, bake, warm hold"
@@ -517,7 +729,6 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
                     onChange={(v) => onUpdateGear({ ...gear, brevillePro: v })}
                   />
 
-                  {/* 4-Burner Cooktop + Portable Induction */}
                   <GearToggleRow
                     title="4-Burner Cooktop + Portable Induction"
                     subtitle="5 total burners for simultaneous cooking"
@@ -525,7 +736,6 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
                     onChange={(v) => onUpdateGear({ ...gear, cooktopAndInduction: v })}
                   />
 
-                  {/* KitchenAid Food Processor */}
                   <GearToggleRow
                     title="KitchenAid Food Processor"
                     subtitle="Prep accelerator for slicing, chopping, sauces"
@@ -533,7 +743,6 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
                     onChange={(v) => onUpdateGear({ ...gear, kitchenAidFoodProcessor: v })}
                   />
 
-                  {/* KitchenAid Stand Mixer */}
                   <GearToggleRow
                     title="KitchenAid Stand Mixer"
                     subtitle="Prep accelerator for mashing, doughs, whipping"
@@ -542,7 +751,6 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
                   />
                 </div>
 
-                {/* Explicit-only Outdoor Appliances */}
                 <div className="pt-3 border-t border-slate-200 space-y-2.5">
                   <div className="text-xs font-semibold text-slate-500">
                     Explicit-Only Outdoor Gear (Off by default)
@@ -566,11 +774,72 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
             )}
           </section>
 
-          {/* Error banner if generation failed */}
+          {/* Live Schedule Generation Status Indicator */}
+          {isGenerating && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="p-4 rounded-2xl bg-slate-900 text-white space-y-2.5"
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <Loader2 className="w-5 h-5 animate-spin shrink-0 text-emerald-400" />
+                  <span className="text-sm font-semibold leading-snug">
+                    {generateStatusText ||
+                      `Scheduling ${recipes.length} ${
+                        recipes.length === 1 ? 'dish' : 'dishes'
+                      } across your kitchen gear...`}
+                  </span>
+                </div>
+                <span className="text-xs font-mono tabular-nums text-slate-300 shrink-0">
+                  {generateElapsedSecs}s / 25s
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-3 pt-1">
+                <span className="text-xs text-slate-300">
+                  Auto-stops if it takes longer than 25 seconds.
+                </span>
+                <button
+                  type="button"
+                  onClick={onCancelGenerate}
+                  className="min-h-[36px] px-3 rounded-lg bg-white/15 hover:bg-white/25 text-xs font-semibold text-white transition-colors whitespace-nowrap"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Visible Schedule Generation Error Box */}
           {generateError && (
-            <div className="p-4 rounded-2xl bg-rose-50 border border-rose-200 text-sm text-rose-800 flex items-start gap-2.5">
-              <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
-              <span>{generateError}</span>
+            <div
+              role="alert"
+              className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 text-rose-950 space-y-2"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-start gap-2">
+                  <AlertCircle className="w-5 h-5 text-rose-700 shrink-0 mt-0.5" />
+                  <div>
+                    <div className="text-sm font-bold">
+                      Failed at: {generateError.step}
+                    </div>
+                    <p className="text-sm text-rose-900 mt-1 break-words font-medium">
+                      {generateError.message}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={onDismissGenerateError}
+                  aria-label="Dismiss schedule error"
+                  className="min-h-[36px] min-w-[36px] rounded-lg flex items-center justify-center text-rose-700 hover:bg-rose-100 shrink-0"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <p className="text-xs text-rose-800 leading-relaxed">
+                <span className="font-bold">What to try next:</span> {generateError.nextStep}
+              </p>
             </div>
           )}
 
@@ -584,7 +853,7 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
             {isGenerating ? (
               <>
                 <Loader2 className="w-5 h-5 animate-spin" />
-                Building Your Schedule...
+                Generating Schedule ({generateElapsedSecs}s)...
               </>
             ) : (
               'Generate Meal Schedule'
@@ -655,7 +924,9 @@ export const MealSetupView: React.FC<MealSetupViewProps> = ({
                           {alreadyAdded ? (
                             <>
                               <Check className="w-3.5 h-3.5 text-emerald-700" />
-                              <span className="text-emerald-700">In tonight’s meal · Tap to add again</span>
+                              <span className="text-emerald-700">
+                                In tonight’s meal · Tap to add again
+                              </span>
                             </>
                           ) : (
                             <span>+ Tap to add to tonight’s meal</span>
