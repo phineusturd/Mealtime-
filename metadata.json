@@ -1,0 +1,6 @@
+{
+  "name": "Mise & Pass",
+  "description": "Synchronized multi-dish kitchen timeline planner, conflict detector, and structured cooking schedule workbench.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
